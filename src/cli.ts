@@ -1,4 +1,5 @@
 import * as path from 'path'
+import * as fs from 'fs/promises'
 import parseArgs = require('yargs-parser')
 import chalk = require('chalk')
 import Listr = require('listr')
@@ -37,8 +38,8 @@ const { version } = require('../package.json')
 
 async function main() {
   const args = parseArgs(process.argv.slice(2), {
-    string: ['apktool', 'certificate'],
-    boolean: ['help', 'wait', 'skip-patches', 'debuggable'],
+    string: ['apktool', 'certificate', 'tmp-dir'],
+    boolean: ['help', 'skip-patches', 'wait', 'debuggable', 'keep-tmp-dir'],
   })
 
   if (args.help) {
@@ -88,7 +89,10 @@ async function main() {
       showSupportedCertificateExtensions()
   }
 
-  const tmpDir = tempy.directory({ prefix: 'apk-mitm-' })
+  let tmpDir = args['tmp-dir']
+    ? path.resolve(process.cwd(), args['tmp-dir'])
+    : tempy.directory({ prefix: 'apk-mitm-' })
+  await fs.mkdir(tmpDir, { recursive: true })
   process.chdir(tmpDir)
 
   const apktool = new Apktool({
@@ -113,7 +117,7 @@ async function main() {
     debuggable: args.debuggable,
   })
     .run()
-    .then(context => {
+    .then(async context => {
       if (taskFunction === patchApk && context.usesAppBundle) {
         showAppBundleWarning()
       }
@@ -121,6 +125,20 @@ async function main() {
       console.log(
         chalk`\n  {green.inverse  Done! } Patched file: {bold ./${outputName}}\n`,
       )
+
+      if (!args['keep-tmp-dir']) {
+        try {
+          await fs.rm(tmpDir, { recursive: true, force: true })
+        } catch (error: any) {
+          // No idea why Windows gives us an `EBUSY: resource busy or locked`
+          // error here, but deleting the temporary directory isn't the most
+          // important thing in the world, so let's just ignore it
+          const ignoreError =
+            process.platform === 'win32' && error.code === 'EBUSY'
+
+          if (!ignoreError) throw error
+        }
+      }
     })
     .catch((error: PatchingError) => {
       const message = getErrorMessage(error, { tmpDir })
@@ -176,6 +194,8 @@ function showHelp() {
 
   {blue {dim.bold *} Optional flags:}
   {dim {bold --wait} Wait for manual changes before re-encoding}
+  {dim {bold --tmp-dir <path>} Where temporary files will be stored}
+  {dim {bold --keep-tmp-dir} Don't delete the temporary directory after patching}
   {dim {bold --debuggable} Make the patched app debuggable}
   {dim {bold --skip-patches} Don't apply any patches (for troubleshooting)}
   {dim {bold --apktool <path-to-jar>} Use custom version of Apktool}
