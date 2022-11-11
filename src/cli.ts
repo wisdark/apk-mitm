@@ -1,5 +1,5 @@
 import * as path from 'path'
-import * as fs from 'fs/promises'
+import * as fs from './utils/fs'
 import parseArgs = require('yargs-parser')
 import chalk = require('chalk')
 import Listr = require('listr')
@@ -18,12 +18,14 @@ export type TaskOptions = {
   outputPath: string
   skipPatches: boolean
   certificatePath?: string
+  mapsApiKey?: string
   apktool: Apktool
   uberApkSigner: UberApkSigner
   tmpDir: string
   wait: boolean
   isAppBundle: boolean
   debuggable: boolean
+  skipDecode: boolean
 }
 
 interface PatchingError extends Error {
@@ -38,7 +40,7 @@ const { version } = require('../package.json')
 
 async function main() {
   const args = parseArgs(process.argv.slice(2), {
-    string: ['apktool', 'certificate', 'tmp-dir'],
+    string: ['apktool', 'certificate', 'tmp-dir', 'maps-api-key'],
     boolean: ['help', 'skip-patches', 'wait', 'debuggable', 'keep-tmp-dir'],
   })
 
@@ -54,33 +56,13 @@ async function main() {
   }
   const inputPath = path.resolve(process.cwd(), input)
 
-  const fileExtension = path.extname(input)
-  const baseName = path.basename(input, fileExtension)
-  const outputName = `${baseName}-patched${fileExtension}`
+  const { taskFunction, skipDecode, isAppBundle, outputName } =
+    await determineTask(inputPath)
   const outputPath = path.resolve(path.dirname(inputPath), outputName)
-
-  let isAppBundle = false
-  let taskFunction: (options: TaskOptions) => Listr
-
-  switch (fileExtension) {
-    case '.apk':
-      taskFunction = patchApk
-      break
-    case '.xapk':
-      isAppBundle = true
-      taskFunction = patchXapkBundle
-      break
-    case '.apks':
-    case '.zip':
-      isAppBundle = true
-      taskFunction = patchApksBundle
-      break
-    default:
-      showSupportedExtensions()
-  }
 
   // Initialize and validate certificate path
   let certificatePath: string | undefined
+  const mapsApiKey: string | undefined = args['maps-api-key']
   if (args.certificate) {
     certificatePath = path.resolve(process.cwd(), args.certificate)
     let certificateExtension = path.extname(certificatePath)
@@ -102,12 +84,19 @@ async function main() {
   const uberApkSigner = new UberApkSigner()
 
   showVersions({ apktool, uberApkSigner })
-  console.log(chalk.dim(`  Using temporary directory:\n  ${tmpDir}\n`))
+  if (skipDecode) {
+    console.log(
+      chalk.dim(`  Patching from decoded apktool directory:\n  ${inputPath}\n`),
+    )
+  } else {
+    console.log(chalk.dim(`  Using temporary directory:\n  ${tmpDir}\n`))
+  }
 
   taskFunction({
     inputPath,
     outputPath,
     certificatePath,
+    mapsApiKey,
     tmpDir,
     apktool,
     uberApkSigner,
@@ -115,6 +104,7 @@ async function main() {
     skipPatches: args.skipPatches,
     isAppBundle,
     debuggable: args.debuggable,
+    skipDecode,
   })
     .run()
     .then(async context => {
@@ -161,6 +151,59 @@ async function main() {
     })
 }
 
+/**
+ * Determines the correct "task" (e.g. "patch APK" or "patch XAPK") depending on
+ * the input path's type (file or directory) and extension (e.g. ".apk").
+ */
+async function determineTask(inputPath: string) {
+  const fileStats = await fs.stat(inputPath)
+
+  let outputFileExtension = '.apk'
+
+  let skipDecode = false
+  let isAppBundle = false
+  let taskFunction: (options: TaskOptions) => Listr
+
+  if (fileStats.isDirectory()) {
+    taskFunction = patchApk
+    skipDecode = true
+
+    const apktoolYamlPath = path.join(inputPath, 'apktool.yml')
+    if (!(await fs.exists(apktoolYamlPath))) {
+      throw new UserError(
+        'No "apktool.yml" file found inside the input directory!' +
+          ' Make sure to specify a directory created by "apktool decode".',
+      )
+    }
+  } else {
+    const inputFileExtension = path.extname(inputPath)
+
+    switch (inputFileExtension) {
+      case '.apk':
+        taskFunction = patchApk
+        break
+      case '.xapk':
+        isAppBundle = true
+        taskFunction = patchXapkBundle
+        break
+      case '.apks':
+      case '.zip':
+        isAppBundle = true
+        taskFunction = patchApksBundle
+        break
+      default:
+        showSupportedExtensions()
+    }
+
+    outputFileExtension = inputFileExtension
+  }
+
+  const baseName = path.basename(inputPath, outputFileExtension)
+  const outputName = `${baseName}-patched${outputFileExtension}`
+
+  return { skipDecode, taskFunction, isAppBundle, outputName }
+}
+
 function getErrorMessage(error: PatchingError, { tmpDir }: { tmpDir: string }) {
   // User errors can be shown without a stack trace
   if (error instanceof UserError) return error.message
@@ -190,7 +233,7 @@ function formatCommandError(error: string, { tmpDir }: { tmpDir: string }) {
 
 function showHelp() {
   console.log(chalk`
-  $ {bold apk-mitm} <path-to-apk/xapk/apks>
+  $ {bold apk-mitm} <path-to-apk/xapk/apks/decoded-directory>
 
   {blue {dim.bold *} Optional flags:}
   {dim {bold --wait} Wait for manual changes before re-encoding}
@@ -200,6 +243,7 @@ function showHelp() {
   {dim {bold --skip-patches} Don't apply any patches (for troubleshooting)}
   {dim {bold --apktool <path-to-jar>} Use custom version of Apktool}
   {dim {bold --certificate <path-to-pem/der>} Add specific certificate to network security config}
+  {dim {bold --maps-api-key <api-key>} Add custom Google Maps API key to be replaced while patching apk}
   `)
 }
 
